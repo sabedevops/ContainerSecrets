@@ -1,0 +1,6 @@
+# ShellCheck configuration
+shell=sh
+#disable=SC2039
+disable=SC2250
+# Enforce POSIX
+enable=all

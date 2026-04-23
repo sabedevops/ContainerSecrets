@@ -1,0 +1,135 @@
+---
+name: CI
+
+on:
+  pull_request:
+    paths:
+      - 'drivers/**'
+      - 'tests/**'
+      - '.shellcheckrc'
+  workflow_dispatch:
+    inputs:
+      driver:
+        description: 'Driver to test'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - secret-tool.sh
+          - skate.sh
+          - systemd-creds.sh
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: './drivers'
+          severity: warning
+
+      - name: Run Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          recursive: true
+          dockerfile: "tests/drivers/*.Containerfile"
+
+  discover-drivers:
+    runs-on: ubuntu-latest
+    outputs:
+      drivers: ${{ steps.set-matrix.outputs.drivers }}
+      has_drivers: ${{ steps.set-matrix.outputs.has_drivers }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: set-matrix
+        name: Determine drivers to test
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.driver }}" = "all" ]; then
+              DRIVERS=$(ls drivers/*.sh || true)
+            else
+              DRIVERS="drivers/${{ inputs.driver }}"
+            fi
+          else
+            # PR context: only get changed drivers
+            DRIVERS=$(git diff --name-only origin/${{ github.base_ref }} HEAD | grep '^drivers/.*\.sh$' || true)
+          fi
+
+          # Drivers that cannot be reliably tested in the standard CI environment
+          SKIP_LIST=("drivers/systemd-creds.sh")
+
+          FINAL_DRIVERS=""
+          for driver in $DRIVERS; do
+            # Check against skip list
+            skip=false
+            for skip_driver in "${SKIP_LIST[@]}"; do
+              if [ "$skip_driver" = "$driver" ]; then
+                skip=true
+                echo "Skipping $driver (found in SKIP_LIST)."
+                break
+              fi
+            done
+
+            if [ "$skip" = false ]; then
+              FINAL_DRIVERS="$FINAL_DRIVERS $driver"
+            fi
+          done
+
+          # Trim leading/trailing whitespace
+          FINAL_DRIVERS=$(echo "$FINAL_DRIVERS" | xargs)
+
+          if [ -z "$FINAL_DRIVERS" ]; then
+            echo "No valid drivers to test."
+            echo "drivers=[]" >> "$GITHUB_OUTPUT"
+            echo "has_drivers=false" >> "$GITHUB_OUTPUT"
+          else
+            # Convert bash list to JSON array
+            JSON_ARRAY=$(for d in $FINAL_DRIVERS; do echo "$d"; done | jq -R -s -c 'split("\n")[:-1]')
+            echo "Drivers to test: $JSON_ARRAY"
+            echo "drivers=$JSON_ARRAY" >> "$GITHUB_OUTPUT"
+            echo "has_drivers=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  test-drivers:
+    needs: [lint, discover-drivers]
+    # Only run the matrix if we actually have drivers to test, otherwise GitHub Actions throws an error for an empty array
+    if: ${{ needs.discover-drivers.outputs.has_drivers == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # Prevent one failing driver from cancelling the rest
+      matrix:
+        driver: ${{ fromJSON(needs.discover-drivers.outputs.drivers) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Test ${{ matrix.driver }}
+        run: |
+          DRIVER_FILE="${{ matrix.driver }}"
+          DRIVER_NAME=$(basename "$DRIVER_FILE")
+          CONTAINER_FILE="tests/${DRIVER_FILE}.Containerfile"
+
+          if [ ! -f "$CONTAINER_FILE" ]; then
+            echo "Error: Missing $CONTAINER_FILE for $DRIVER_FILE"
+            echo "Please ensure you create a Containerfile to test your driver."
+            exit 1
+          fi
+
+          IMAGE_NAME="driver-test-${DRIVER_NAME%.sh}"
+
+          echo "::group::Building test environment for $DRIVER_NAME"
+          docker build --build-arg IMAGE_VERSION=latest -f "$CONTAINER_FILE" -t "$IMAGE_NAME" .
+          echo "::endgroup::"
+
+          echo "::group::Running test script"
+          docker run --rm -v "$PWD:/workspace" "$IMAGE_NAME" /workspace/tests/test_driver.sh "/workspace/$DRIVER_FILE"
+          echo "::endgroup::"

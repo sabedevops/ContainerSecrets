@@ -5,7 +5,7 @@
 set -o nounset
 set -o errexit
 
-usage() { 
+usage() {
     echo "Usage: $0 {list|lookup|store|delete}" >&2
     exit 1
 }
@@ -13,6 +13,17 @@ usage() {
 if [ "$#" -ne 1 ]; then
     usage
 fi
+
+_check_dependencies() {
+    for cmd in secret-tool md5sum awk; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            echo "Error: Required command '$cmd' not found" >&2
+            exit 1
+        fi
+    done
+}
+
+_check_dependencies
 
 # You MAY specify the secrets collection with:
 #
@@ -28,6 +39,13 @@ COLLECTION_ID="$(printf "%s" "$COLLECTION" | md5sum | awk '{print $1}')"
 
 APP_ID='ContainerSecrets'
 
+_ensure_secret_id() {
+    if [ -z "${SECRET_ID:-}" ]; then
+        echo "Error: SECRET_ID must be set" >&2
+        exit 1
+    fi
+}
+
 list() {
     # secret-tool writes attributes to stderr for some reason
     # prevent masking errors while avoiding `set -o pipefail`
@@ -41,6 +59,7 @@ list() {
 }
 
 lookup() {
+    _ensure_secret_id
     secret-tool lookup \
         COLLECTION_ID "$COLLECTION_ID" \
         APP_ID "$APP_ID" \
@@ -48,7 +67,16 @@ lookup() {
 }
 
 store() {
-    secret-tool store \
+    _ensure_secret_id
+    # Read stdin and ensure it's not empty, preserving trailing newlines
+    CONTENT=$(cat; printf 'x')
+    CONTENT="${CONTENT%x}"
+
+    if [ -z "$CONTENT" ]; then
+        echo "Error: stdin is empty" >&2
+        exit 1
+    fi
+    printf "%s" "$CONTENT" | secret-tool store \
         --collection="$COLLECTION" \
         --label="$APP_ID ($SECRET_ID)" \
         COLLECTION_ID "$COLLECTION_ID" \
@@ -57,6 +85,7 @@ store() {
 }
 
 delete() {
+    _ensure_secret_id
     secret-tool clear \
         COLLECTION_ID "$COLLECTION_ID" \
         APP_ID "$APP_ID" \
